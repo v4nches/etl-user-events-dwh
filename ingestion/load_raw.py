@@ -1,61 +1,70 @@
 import os
 import sys
+import time
+from dataclasses import dataclass
+
 import pandas as pd
 import psycopg2
 from psycopg2.extras import execute_values
 
-#  (вынесен в .env) 
-PG_HOST = "localhost"
-PG_PORT = 5432
-PG_DB = "user_events_dwh"
-PG_USER = "ivan"      
-PG_PASSWORD = ""      
-
-#  пути 
+# Пути проекта
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+ENV_PATH = os.path.join(PROJECT_ROOT, ".env")
+
 USERS_CSV = os.path.join(PROJECT_ROOT, "data", "users.csv")
 EVENTS_CSV = os.path.join(PROJECT_ROOT, "data", "events.csv")
 
 
-def connect():
-    return psycopg2.connect(
-        host=PG_HOST,
-        port=PG_PORT,
-        dbname=PG_DB,
-        user=PG_USER,
-        password=PG_PASSWORD,
+# Загрузка .env (без зависимостей)
+def load_dotenv(path: str) -> None:
+    if not os.path.exists(path):
+        print(f"Файл .env не найден: {path}")
+        return
+
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip("'").strip('"'))
+
+# Конфигурация БД
+@dataclass(frozen=True)
+class PgConfig:
+    host: str
+    port: int
+    dbname: str
+    user: str
+    password: str
+
+def get_pg_config() -> PgConfig:
+    load_dotenv(ENV_PATH)
+
+    def required(name: str) -> str:
+        value = os.getenv(name)
+        if not value:
+            raise RuntimeError(f"Отсутствует переменная окружения {name} (проверь .env)")
+        return value
+
+    return PgConfig(
+        host=required("PGHOST"),
+        port=int(required("PGPORT")),
+        dbname=required("PGDATABASE"),
+        user=required("PGUSER"),
+        password=required("PGPASSWORD"),
     )
 
+def connect(cfg: PgConfig):
+    return psycopg2.connect(
+        host=cfg.host,
+        port=cfg.port,
+        dbname=cfg.dbname,
+        user=cfg.user,
+        password=cfg.password,
+    )
 
-def read_users(path: str) -> pd.DataFrame:
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Файл не найден: {path}")
-    df = pd.read_csv(path)
-
-    required = ["user_id", "email", "country", "created_at", "updated_at"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"users.csv: не хватает колонок: {missing}")
-
-    df["created_at"] = pd.to_datetime(df["created_at"], errors="raise")
-    df["updated_at"] = pd.to_datetime(df["updated_at"], errors="raise")
-    return df[required]
-
-
-def read_events(path: str) -> pd.DataFrame:
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Файл не найден: {path}")
-    df = pd.read_csv(path)
-
-    required = ["event_id", "user_id", "event_type", "event_ts"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"events.csv: не хватает колонок: {missing}")
-
-    df["event_ts"] = pd.to_datetime(df["event_ts"], errors="raise")
-    return df[required]
-
-
+# SQL операции
 def upsert_users(cur, rows):
     sql = """
         INSERT INTO raw.users (user_id, email, country, created_at, updated_at)
@@ -66,52 +75,107 @@ def upsert_users(cur, rows):
             created_at = EXCLUDED.created_at,
             updated_at = EXCLUDED.updated_at;
     """
-    execute_values(cur, sql, rows, page_size=1000)
+    execute_values(cur, sql, rows, page_size=5000)
 
 
 def upsert_events(cur, rows):
     sql = """
         INSERT INTO raw.events (event_id, user_id, event_type, event_ts)
         VALUES %s
-        ON CONFLICT (event_id) DO UPDATE SET
-            user_id = EXCLUDED.user_id,
-            event_type = EXCLUDED.event_type,
-            event_ts = EXCLUDED.event_ts;
+        ON CONFLICT (event_id) DO NOTHING;
     """
-    execute_values(cur, sql, rows, page_size=1000)
+    execute_values(cur, sql, rows, page_size=5000)
 
 
+# Логирование
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
+# Основной процесс
 def main():
-    print("=== RAW ingestion started ===")
-    print("Users:", USERS_CSV)
-    print("Events:", EVENTS_CSV)
+    start_time = time.time()
 
-    users_df = read_users(USERS_CSV)
-    events_df = read_events(EVENTS_CSV)
+    cfg = get_pg_config()
 
-    users_rows = list(users_df.itertuples(index=False, name=None))
-    events_rows = list(events_df.itertuples(index=False, name=None))
+    log("=== Загрузка RAW-данных начата ===")
+    log(f"Подключение: {cfg.user}@{cfg.host}:{cfg.port}/{cfg.dbname}")
+    log(f"Файл пользователей: {USERS_CSV}")
+    log(f"Файл событий:       {EVENTS_CSV}")
 
-    try:
-        conn = connect()
-    except Exception as e:
-        raise RuntimeError("Не удалось подключиться к PostgreSQL. Проверь PG_* вверху файла.") from e
+    users_chunk_size = 200_000
+    events_chunk_size = 200_000
 
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                upsert_users(cur, users_rows)
-                upsert_events(cur, events_rows)
-        print(f"OK: users={len(users_rows)}, events={len(events_rows)} загружены в {PG_DB}")
-    finally:
-        conn.close()
+    total_users = 0
+    total_events = 0
 
-    print("=== RAW ingestion finished ===")
+    if not os.path.exists(USERS_CSV):
+        raise FileNotFoundError(f"Файл users.csv не найден: {USERS_CSV}")
+
+    if not os.path.exists(EVENTS_CSV):
+        raise FileNotFoundError(f"Файл events.csv не найден: {EVENTS_CSV}")
+
+    with connect(cfg) as conn:
+        conn.autocommit = False
+
+        with conn.cursor() as cur:
+            # ---------- USERS ----------
+            log("\n--- Загрузка пользователей ---")
+            for i, chunk in enumerate(
+                pd.read_csv(
+                    USERS_CSV,
+                    chunksize=users_chunk_size,
+                    parse_dates=["created_at", "updated_at"],
+                )
+            ):
+                chunk["user_id"] = chunk["user_id"].astype("int64")
+
+                rows = list(
+                    chunk[["user_id", "email", "country", "created_at", "updated_at"]]
+                    .itertuples(index=False, name=None)
+                )
+
+                upsert_users(cur, rows)
+                conn.commit()
+
+                total_users += len(rows)
+                log(f"Пользователи: чанк {i + 1}, строк = {len(rows)}, всего = {total_users}")
+
+            # ---------- EVENTS ----------
+            log("\n--- Загрузка событий ---")
+            for i, chunk in enumerate(
+                pd.read_csv(
+                    EVENTS_CSV,
+                    chunksize=events_chunk_size,
+                    parse_dates=["event_ts"],
+                )
+            ):
+                chunk["event_id"] = chunk["event_id"].astype("int64")
+                chunk["user_id"] = chunk["user_id"].astype("int64")
+
+                rows = list(
+                    chunk[["event_id", "user_id", "event_type", "event_ts"]]
+                    .itertuples(index=False, name=None)
+                )
+
+                upsert_events(cur, rows)
+                conn.commit()
+
+                total_events += len(rows)
+                log(f"События: чанк {i + 1}, строк = {len(rows)}, всего = {total_events}")
+
+    elapsed = time.time() - start_time
+
+    log("\n=== Загрузка RAW-данных завершена ===")
+    log(f"Всего пользователей загружено: {total_users}")
+    log(f"Всего событий загружено:       {total_events}")
+    log(f"Время выполнения: {elapsed:.1f} сек")
 
 
 if __name__ == "__main__":
     try:
         main()
-    except Exception as err:
-        print(f"ERROR: {err}")
-        sys.exit(1)
+    except Exception as exc:
+        print("\nОшибка при выполнении загрузки RAW:", file=sys.stderr)
+        print(str(exc), file=sys.stderr)
+        raise
