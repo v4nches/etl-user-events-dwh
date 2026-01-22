@@ -1,0 +1,15 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# OS / IDE
+.DS_Store
+.vscode/
+
+# Secrets
+.env
+
+# Data (сырые/генерируемые файлы)
+data/
+data/kaggle_raw/
