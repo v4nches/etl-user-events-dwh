@@ -43,8 +43,10 @@ def get_pg_config() -> PgConfig:
 
     def required(name: str) -> str:
         value = os.getenv(name)
-        if not value:
-            raise RuntimeError(f"Отсутствует переменная окружения {name} (проверь .env)")
+        if value is None:
+            raise RuntimeError(
+                f"Отсутствует переменная окружения {name} (проверь .env)"
+            )
         return value
 
     return PgConfig(
@@ -52,8 +54,9 @@ def get_pg_config() -> PgConfig:
         port=int(required("PGPORT")),
         dbname=required("PGDATABASE"),
         user=required("PGUSER"),
-        password=required("PGPASSWORD"),
+        password=os.getenv("PGPASSWORD", ""),  # ← пустая строка допустима
     )
+
 
 def connect(cfg: PgConfig):
     return psycopg2.connect(
